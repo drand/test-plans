@@ -1,0 +1,28 @@
+name = "ceremony"
+[defaults]
+builder = "exec:go"
+runner = "local:exec"
+
+[builders."docker:go"]
+enabled = true
+go_version = "1.14"
+module_path = "github.com/drand/test-plans/ceremony"
+exec_pkg = "."
+
+[builders."exec:go"]
+enabled = true
+module_path = "github.com/drand/test-plans/ceremony"
+
+[runners."local:docker"]
+enabled = true
+
+[runners."local:exec"]
+enabled = true
+
+[runners."cluser:k8s"]
+enabled = true
+
+[[testcases]]
+name = "ceremony"
+instances = { min = 1, max = 7, default = 5 }
+
