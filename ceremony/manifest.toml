@@ -25,4 +25,6 @@ enabled = true
 [[testcases]]
 name = "ceremony"
 instances = { min = 1, max = 7, default = 5 }
+  [testcases.params]
+  timeout_secs = { type = "int", desc = "how long before timeout", unit = "seconds", default = 300 }
 
