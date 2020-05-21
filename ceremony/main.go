@@ -50,65 +50,47 @@ func run(runenv *runtime.RunEnv) error {
 
 	seq := client.MustSignalAndWait(ctx, "ip-allocation", runenv.TestInstanceCount)
 	runenv.RecordMessage("I am %d", seq)
-
-	config := &network.Config{
-		Network: "default",
-		Enable:  true,
-		Default: network.LinkShape{
-			Latency:   10 * time.Millisecond,
-			Bandwidth: 1 << 24,
-		},
-	}
-	config.IPv4 = &runenv.TestSubnet.IPNet
-	config.IPv4.IP = append(config.IPv4.IP[0:3], byte(seq))
-	leaderIP := append(config.IPv4.IP[0:3], byte(1))
-	config.CallbackState = "ip-set"
-
-	err := netclient.ConfigureNetwork(ctx, config)
-	if err != nil {
-		runenv.RecordCrash(err)
-		return err
-	}
-	runenv.RecordMessage("configured ip off seq. syncing")
-	client.MustSignalAndWait(ctx, "ip-changed", runenv.TestInstanceCount)
+	isLeader := seq == 1
 
 	// spin up drand
 	startTime := time.Now()
-	isLeader := seq == 1
 
-	n := node.NewLocalNode(int(seq), "10s", "~/", false, "0.0.0.0")
+	myAddr := netclient.MustGetDataNetworkIP()
+	n := node.NewLocalNode(int(seq), "10s", "~/", false, myAddr.String())
 	defer n.Stop()
 
 	// TODO: node tls keys would need to get shuffled all-all if using TLS.
-	type NodePort struct {
-		Port string
+	threshold := math.Ceil(float64(runenv.TestInstanceCount) / 2.0)
+
+	type LeaderAddr struct {
+		Addr string
 	}
-	portTopic := sync.NewTopic("port-key", &NodePort{})
-	var leaderPort string
+	leaderTopic := sync.NewTopic("leader", &LeaderAddr{})
+	var leaderAddr string
 	if isLeader {
 		_, leaderPort, err := net.SplitHostPort(n.PrivateAddr())
 		if err != nil {
 			return err
 		}
-		_, err = client.Publish(ctx, portTopic, &NodePort{leaderPort})
+		leaderIP := netclient.MustGetDataNetworkIP()
+		leaderAddr = fmt.Sprintf("%s:%s", leaderIP, leaderPort)
+		_, err = client.Publish(ctx, leaderTopic, &LeaderAddr{leaderAddr})
 		if err != nil {
 			return err
 		}
 	}
 
-	client.MustSignalAndWait(ctx, "port-share", runenv.TestInstanceCount)
-
+	tch := make(chan *LeaderAddr)
 	if !isLeader {
-		tch := make(chan *NodePort)
-		_, err := client.Subscribe(ctx, portTopic, tch)
+		_, err := client.Subscribe(ctx, leaderTopic, tch)
 		if err != nil {
 			return nil
 		}
-		if p, ok := <-tch; !ok {
-			return fmt.Errorf("Failed to learn leader port.")
-		} else {
-			leaderPort = p.Port
+		p, ok := <-tch
+		if !ok {
+			return fmt.Errorf("failed to learn leader")
 		}
+		leaderAddr = p.Addr
 	}
 
 	client.MustSignalAndWait(ctx, "drand-start", runenv.TestInstanceCount)
@@ -129,18 +111,16 @@ func run(runenv *runtime.RunEnv) error {
 		return fmt.Errorf("Node %d failed to start", seq)
 	}
 
-	// run dkg
-	threshold := math.Ceil(float64(runenv.TestInstanceCount) / 2.0)
-	n.RunDKG(int(seq), int(threshold), "10s", isLeader, fmt.Sprintf("%s:%s", leaderIP.String(), leaderPort), 12)
-	runenv.R().RecordPoint("dkg_complete", time.Now().Sub(startTime).Seconds())
-
 	var grp *key.Group
-	for i := 0; i < 10; i++ {
-		grp = n.GetGroup()
-		if grp != nil {
-			break
-		}
-		time.Sleep(time.Second)
+	// run dkg
+	if isLeader {
+		client.Publish(ctx, leaderTopic, &LeaderAddr{leaderAddr})
+		grp = n.RunDKG(runenv.TestInstanceCount, int(threshold), "10s", isLeader, leaderAddr, 12)
+		runenv.R().RecordPoint("dkg_complete", time.Now().Sub(startTime).Seconds())
+	} else {
+		<-tch
+		grp = n.RunDKG(runenv.TestInstanceCount, int(threshold), "10s", isLeader, leaderAddr, 12)
+		runenv.R().RecordPoint("dkg_complete", time.Now().Sub(startTime).Seconds())
 	}
 
 	to := time.Until(time.Unix(grp.GenesisTime, 0).Add(3 * time.Second).Add(grp.Period))
@@ -151,7 +131,7 @@ func run(runenv *runtime.RunEnv) error {
 	rnd := beacon.CurrentRound(time.Now().Unix(), grp.Period, grp.GenesisTime)
 	b, _ := n.GetBeacon("group.toml", rnd)
 	if b == nil {
-		return fmt.Errorf("Failed to get beacon.")
+		return fmt.Errorf("failed to get beacon")
 	}
 	runenv.R().RecordPoint("beacon_lat", time.Now().Sub(beaconStart).Seconds())
 
