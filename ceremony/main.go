@@ -54,7 +54,8 @@ func run(runenv *runtime.RunEnv) error {
 	isLeader := seq == 1
 
 	// spin up drand
-	SavePrometheusAsDiagnostics(runenv, metrics.PrivateMetrics, "diagnostics.out")
+	metrics.Start(":0", nil, nil)
+	SavePrometheusAsDiagnostics(runenv, metrics.PrivateMetrics)
 	startTime := time.Now()
 
 	myAddr := netclient.MustGetDataNetworkIP()

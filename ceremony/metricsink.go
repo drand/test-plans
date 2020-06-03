@@ -2,82 +2,170 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"io"
+	"fmt"
 	"time"
 
+	_ "github.com/influxdata/influxdb1-client" // this is important because of the bug in go mod
+	client "github.com/influxdata/influxdb1-client/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/expfmt"
-	"github.com/prometheus/common/model"
+	promodel "github.com/prometheus/client_model/go"
 	"github.com/testground/sdk-go/runtime"
 )
 
-// TODO: JSON bridge can live in drand/metrics
-
-// JSONBridge takes a set of metrics and periodically writes them
-// to a json sink.
-type JSONBridge struct {
+// InfluxBridge takes a set of metrics and periodically writes them
+// to an influx store
+type InfluxBridge struct {
 	interval time.Duration
 
 	g      prometheus.Gatherer
 	labels prometheus.Labels
-	sink   *json.Encoder
+	sink   client.Client
 }
 
 // Start begins periodically gathering metrics and writing them to the sync
-func (j *JSONBridge) Start(ctx context.Context) {
-	go j.background(ctx)
+func (j *InfluxBridge) Start(ctx context.Context, re *runtime.RunEnv) {
+	go j.background(ctx, re)
 }
 
-func (j *JSONBridge) background(ctx context.Context) {
+func (j *InfluxBridge) background(ctx context.Context, re *runtime.RunEnv) {
 	t := time.NewTimer(j.interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			j.Save(re)
 			return
 		case <-t.C:
-			j.Save()
+			j.Save(re)
 			t.Reset(j.interval)
 		}
 	}
 }
 
 // Save records one snapshot of gathered metrics to the sink.
-func (j *JSONBridge) Save() {
+func (j *InfluxBridge) Save(re *runtime.RunEnv) {
 	metrics, err := j.g.Gather()
 	if err != nil {
+		re.RecordFailure(err)
 		return
 	}
-	vec, err := expfmt.ExtractSamples(&expfmt.DecodeOptions{
-		Timestamp: model.Now(),
-	}, metrics...)
-	for _, s := range vec {
-		j.tag(s.Metric, j.labels)
-		j.sink.Encode(s)
+	re.RecordMessage("Recording metrics snapshot.")
+	batch, err := client.NewBatchPoints(client.BatchPointsConfig{
+		Database: "testground",
+	})
+	if err != nil {
+		re.RecordFailure(err)
+		return
 	}
+
+	for _, f := range metrics {
+		p := j.tag(f, j.labels)
+		batch.AddPoint(p)
+	}
+
+	j.sink.Write(batch)
 }
 
-func (j *JSONBridge) tag(m model.Metric, l prometheus.Labels) {
-	for n, v := range l {
-		m[model.LabelName(n)] = model.LabelValue(v)
+func (j *InfluxBridge) tag(family *promodel.MetricFamily, l prometheus.Labels) *client.Point {
+	name := *family.Name
+	tags := make(map[string]string)
+	for k, v := range l {
+		tags[k] = v
 	}
+	fields := make(map[string]interface{})
+
+	// labels which are constant within the family become tags
+	// keys which vary are in fieldTags, and are used to create field name.
+	fieldTags := make(map[string]bool)
+	ct := make(map[string]string)
+	for _, m := range family.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if _, ok := ct[l.GetName()]; ok {
+				if ct[l.GetName()] != l.GetValue() {
+					fieldTags[l.GetName()] = true
+				}
+			} else {
+				ct[l.GetName()] = l.GetValue()
+			}
+		}
+	}
+	for k, v := range ct {
+		if _, ok := fieldTags[k]; !ok {
+			tags[k] = v
+		}
+	}
+
+	switch family.GetType() {
+	case promodel.MetricType_COUNTER:
+		for _, m := range family.GetMetric() {
+			n := makeName(fieldTags, m.GetLabel())
+			fields[n] = m.GetCounter().GetValue()
+		}
+	case promodel.MetricType_GAUGE:
+		for _, m := range family.GetMetric() {
+			n := makeName(fieldTags, m.GetLabel())
+			fields[n] = m.GetGauge().GetValue()
+		}
+	case promodel.MetricType_HISTOGRAM:
+		for _, m := range family.GetMetric() {
+			buckets := m.GetHistogram().GetBucket()
+			for _, b := range buckets {
+				fields[fmt.Sprintf("%f", b.GetUpperBound())] = b.GetCumulativeCount()
+			}
+			n := makeName(fieldTags, m.GetLabel())
+			fields[n] = m.GetHistogram().GetSampleSum()
+		}
+	case promodel.MetricType_SUMMARY:
+		for _, m := range family.GetMetric() {
+			quantile := m.GetSummary().GetQuantile()
+			for _, q := range quantile {
+				fields[fmt.Sprintf("%f", q.GetQuantile())] = q.GetValue()
+			}
+			n := makeName(fieldTags, m.GetLabel())
+			fields[n] = m.GetSummary().GetSampleSum()
+		}
+	case promodel.MetricType_UNTYPED:
+		for _, m := range family.GetMetric() {
+			n := makeName(fieldTags, m.GetLabel())
+			fields[n] = m.GetUntyped().GetValue()
+		}
+	}
+
+	p, _ := client.NewPoint(name, tags, fields, time.Now())
+	return p
 }
 
-// NewJSONBridge careates a JSON bridge
-func NewJSONBridge(metrics prometheus.Gatherer, interval time.Duration, destination io.Writer) *JSONBridge {
-	enc := json.NewEncoder(destination)
-	bridge := JSONBridge{
+func makeName(tags map[string]bool, label []*promodel.LabelPair) string {
+	s := ""
+	for _, l := range label {
+		if tags[l.GetName()] {
+			if s != "" {
+				s += ","
+			}
+			s += l.GetName() + "_" + l.GetValue()
+		}
+	}
+	if s == "" {
+		s = "value"
+	}
+	return s
+}
+
+// NewInfluxBridge careates an influx bridge
+func NewInfluxBridge(metrics prometheus.Gatherer, interval time.Duration, destination client.Client) *InfluxBridge {
+	bridge := InfluxBridge{
 		interval: interval,
 		g:        metrics,
 		labels:   prometheus.Labels{},
-		sink:     enc,
+		sink:     destination,
 	}
 	return &bridge
 }
 
-func SavePrometheusAsDiagnostics(re *runtime.RunEnv, gatherer prometheus.Gatherer, filename string) {
-	f, err := re.CreateRawAsset(filename)
+// SavePrometheusAsDiagnostics drops a gatherer into a raw asset for the run env to upload.
+func SavePrometheusAsDiagnostics(re *runtime.RunEnv, gatherer prometheus.Gatherer) {
+	c, err := runtime.NewInfluxDBClient(re)
 	if err != nil {
 		panic(err)
 	}
@@ -87,7 +175,7 @@ func SavePrometheusAsDiagnostics(re *runtime.RunEnv, gatherer prometheus.Gathere
 		"run":      re.TestRun,
 		"group_id": re.TestGroupID,
 	}
-	bridge := NewJSONBridge(gatherer, time.Second, f)
+	bridge := NewInfluxBridge(gatherer, time.Second, c)
 	bridge.labels = extras
-	bridge.Start(context.Background())
+	bridge.Start(context.Background(), re)
 }
