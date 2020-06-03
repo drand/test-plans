@@ -7,9 +7,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/drand/drand/beacon"
+	"github.com/drand/drand/chain"
 	"github.com/drand/drand/demo/node"
 	"github.com/drand/drand/key"
+	"github.com/drand/drand/metrics"
 	"github.com/testground/sdk-go/network"
 	"github.com/testground/sdk-go/runtime"
 	"github.com/testground/sdk-go/sync"
@@ -53,6 +54,8 @@ func run(runenv *runtime.RunEnv) error {
 	isLeader := seq == 1
 
 	// spin up drand
+	metrics.Start(":0", nil, nil)
+	SavePrometheusAsDiagnostics(runenv, metrics.PrivateMetrics)
 	startTime := time.Now()
 
 	myAddr := netclient.MustGetDataNetworkIP()
@@ -128,7 +131,7 @@ func run(runenv *runtime.RunEnv) error {
 
 	beaconStart := time.Now()
 	key.Save("group.toml", grp, false)
-	rnd := beacon.CurrentRound(time.Now().Unix(), grp.Period, grp.GenesisTime)
+	rnd := chain.CurrentRound(time.Now().Unix(), grp.Period, grp.GenesisTime)
 	b, _ := n.GetBeacon("group.toml", rnd)
 	if b == nil {
 		return fmt.Errorf("failed to get beacon")
